@@ -23,6 +23,7 @@ MANIFEST
 
 # Virtual environments
 venv/
+pokemon/
 env/
 ENV/
 env.bak/
