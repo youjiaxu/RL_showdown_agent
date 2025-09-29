@@ -1,0 +1,116 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.env
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+.npm
+.node_repl_history
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+*.tmp
+*.temp
+*.log
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# Pokemon Showdown specific
+pokemon-showdown/logs/
+pokemon-showdown/databases/
+pokemon-showdown/.server-dist/
+
+# RL Training outputs
+models/
+results/
+logs/
+checkpoints/
+tensorboard/
+wandb/
+*.pkl
+*.pt
+*.pth
+*.h5
+
+# Data files
+data/
+datasets/
+*.csv
+*.json.bak
+*.npy
+*.npz
+
+# Temporary files
+tmp/
+temp/
+.cache/
+.pytest_cache/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Other project folders (not part of assignment)
+cares_reinforcement_learning/
+gymnasium_envrionments/
+pokemon-showdown/
