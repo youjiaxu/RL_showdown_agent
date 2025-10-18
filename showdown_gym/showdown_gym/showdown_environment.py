@@ -265,7 +265,14 @@ class ShowdownEnvironment(BaseShowdownEnv):
     
         #checks for move's priority 
     def move_priority(self, move, battle) -> int:
-        return int(getattr(move, 'priority', 0)) if move else 0
+        if not move:
+            return 0
+        if hasattr(move, 'entry') and move.entry and 'priority' in move.entry:
+            try:
+                return int(move.entry['priority'])
+            except (KeyError, ValueError, TypeError):
+                return 0
+        return 0
         #estimates damage based on chosen attacker and defender pokemon, accounts for STAB, stage and effectiveness multipliers
         
     def estimate_move_damage(self, move: Move, attacker: Pokemon, defender: Pokemon, battle: AbstractBattle) -> float:
@@ -376,7 +383,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             active = battle.active_pokemon
             opp_active = battle.opponent_active_pokemon
             
-            # Normalized stats (divide by typical max values)
+            # Normalized stats (divided by max values)
             state.extend([
                 self.calculate_stat(active, 'atk') / 500.0,
                 self.calculate_stat(active, 'def') / 500.0,
@@ -440,11 +447,14 @@ class ShowdownEnvironment(BaseShowdownEnv):
                     base_power = getattr(move, 'base_power', 0) or 0
                     move_category = getattr(move, 'category', None)
                     
+                    # Get priority using centralized safe helper
+                    move_priority = self.move_priority(move, battle)
+                    
                     move_features.extend([
                         base_power / 150.0,  # Normalized power
                         effectiveness / 4.0,  # Effectiveness (0-4x range)
                         damage,  # Estimated damage ratio
-                        getattr(move, 'priority', 0) / 5.0 + 0.5,  # Priority normalized to [0,1]
+                        move_priority / 5.0 + 0.5,  # Priority normalized to [0,1]
                         1.0 if move_category == MoveCategory.PHYSICAL else 0.0,  # Physical flag
                         1.0 if move_category == MoveCategory.SPECIAL else 0.0,  # Special flag
                         1.0 if move_category == MoveCategory.STATUS else 0.0,  # Status flag
