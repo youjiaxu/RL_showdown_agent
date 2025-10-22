@@ -28,9 +28,9 @@ class BaseShowdownEnv(SinglesEnv):
             log_level=logging.ERROR,
             battle_format=battle_format,
             team=team,
-            open_timeout=None,
-            ping_interval=None,
-            ping_timeout=None,
+            open_timeout=30,     # 30 second connection timeout
+            ping_interval=20,    # Send ping every 20 seconds to keep connection alive
+            ping_timeout=10,     # Wait 10 seconds for ping response
         )
 
         observation_size = self._observation_size()
