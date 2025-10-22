@@ -297,7 +297,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Component 4: Strategic outcome rewards (encourages switching)
         strategic_reward = self._calculate_strategic_outcomes(battle, prior_battle)
         
-        # BALANCED MAGNITUDES: damage ±2.0, KO ±4-8, win ±10-12, strategic 0-4, immediate ±2.5, spam -4-0
         total_reward = damage_reward + ko_reward + outcome_reward + strategic_reward
         
         # Add immediate feedback bonuses for faster learning
@@ -458,52 +457,67 @@ class ShowdownEnvironment(BaseShowdownEnv):
                         status_reward = self._evaluate_status_move_effectiveness(move_used, battle, prior_battle)
                         reward += status_reward  # Smart status use vs redundant spam
         
-        # switching incentives
+        # ENHANCED: Strategic switching that considers BOTH offense and defense
         if (hasattr(self, 'action_history') and len(self.action_history) > 0 and 
             self.action_history[-1].get('action_type') == 'switch'):
             
             prior_hp_fraction = self.action_history[-1].get('hp_fraction', 1.0)
             
-            # Reward strategic/aggressive switches that lead to better matchups
+            # Reward strategic switches that improve our overall battle position
             if battle.active_pokemon and battle.opponent_active_pokemon:
-                # Check if we switched to a Pokemon with type advantage
+                # Calculate offensive advantage (how much damage we deal)
                 our_types = self._extract_pokemon_types(battle.active_pokemon)
                 opp_types = self._extract_pokemon_types(battle.opponent_active_pokemon)
                 
-                # Calculate average effectiveness of our types vs opponent
                 if our_types and opp_types:
-                    total_effectiveness = 0.0
-                    type_count = 0
+                    # Offensive effectiveness (our attacks vs opponent)
+                    offensive_total = 0.0
+                    offensive_count = 0
                     for our_type in our_types:
                         for opp_type in opp_types:
                             try:
                                 effectiveness = self.move_effectiveness(our_type, (opp_type,))
-                                total_effectiveness += effectiveness
-                                type_count += 1
+                                offensive_total += effectiveness
+                                offensive_count += 1
                             except:
                                 pass
                     
-                    if type_count > 0:
-                        avg_effectiveness = total_effectiveness / type_count 
+                    # Defensive effectiveness (opponent attacks vs us)  
+                    defensive_total = 0.0
+                    defensive_count = 0
+                    for opp_type in opp_types:
+                        for our_type in our_types:
+                            try:
+                                incoming_effectiveness = self.move_effectiveness(opp_type, (our_type,))
+                                defensive_total += incoming_effectiveness
+                                defensive_count += 1
+                            except:
+                                pass
+                    
+                    if offensive_count > 0 and defensive_count > 0:
+                        avg_offensive = offensive_total / offensive_count
+                        avg_defensive = defensive_total / defensive_count    
+
+                        switch_value = avg_offensive / max(avg_defensive, 0.25) 
                         
-                        # STABLE: Moderate type matchup learning signals (clear but not extreme)
-                        if avg_effectiveness >= 2.0:  # Super effective (2x or 4x)
-                            reward += 1.2  # REDUCED from 1.8 (excellent switch, moderate reward)
-                        elif avg_effectiveness >= 1.5:  # Strong advantage
-                            reward += 0.8  # REDUCED from 1.2 (good strategic switch)
-                        elif avg_effectiveness > 1.2:  # Moderate advantage
-                            reward += 0.5  # REDUCED from 0.8 (decent switch)
-                        elif avg_effectiveness >= 0.9:  # Neutral matchup
+                        # reward switches without over-incentivizing switching
+                        if switch_value >= 3.0:
+                            reward += 1.4  # Strong reward for perfect switches
+                        elif switch_value >= 2.0: 
+                            reward += 1.0  # Good strategic switch
+                        elif switch_value >= 1.5:  
+                            reward += 0.6  # Decent switch
+                        elif switch_value >= 1.0:  # Neutral: roughly even matchup
                             if prior_hp_fraction < 0.3:
-                                reward += 0.4  # REDUCED from 0.6 (emergency escape OK)
+                                reward += 0.4  # Emergency escape bonus
                             else:
-                                reward -= 0.1  # REDUCED from -0.2 (mild discouragement)
-                        elif avg_effectiveness >= 0.75:  # Slight disadvantage
-                            reward -= 0.5  # REDUCED from -0.8 (clear but not harsh)
-                        elif avg_effectiveness < 0.75:  # Major disadvantage
-                            reward -= 0.8  # REDUCED from -1.5 (strong but learnable penalty) 
+                                reward -= 0.1  # Mild discouragement for lateral moves
+                        elif switch_value >= 0.7:  # Slight disadvantage
+                            reward -= 0.4
+                        else: 
+                            reward -= 0.8 # bad switches 
         
-        return np.clip(reward, -2.0, 2.5)
+        return np.clip(reward, -2.0, 3.0) 
     
     def _calculate_spam_penalties(self, battle: AbstractBattle, prior_battle: AbstractBattle | None) -> float:
         """
@@ -580,8 +594,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
             battle_phase = self.calculate_battle_phase(battle)
             our_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0) if battle.active_pokemon else 1.0
             
-            # strategic setup awards
-            if battle_phase < 0.3 and our_hp > 0.7:
+            # BALANCED: Modest strategic setup reward (now similar to good attacking moves)
+            if battle_phase < 0.2 and our_hp > 0.8:  # Stricter conditions
                 # Check if we have type advantage (safe to setup)
                 if battle.active_pokemon and battle.opponent_active_pokemon:
                     our_types = self._extract_pokemon_types(battle.active_pokemon)
@@ -591,8 +605,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
                         type_advantage = sum(self.move_effectiveness(our_type, (opp_types[0],)) 
                                            for our_type in our_types) / len(our_types)
                         
-                        if type_advantage > 1.0:  # We resist them or neutral
-                            reward += 3.0
+                        if type_advantage >= 1.0:  # We resist them or neutral
+                            reward += 0.8  # REDUCED from 3.0 (now comparable to good type matchup attacking)
         
         # === ENTRY HAZARD REWARDS (Long-term Strategy) ===
         if (hasattr(self, 'action_history') and len(self.action_history) > 0 and
@@ -602,7 +616,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             
             # Reward hazards in early-mid game
             if battle_phase < 0.4:
-                reward += 2.5  # REWARD strategic hazard setup
+                reward += 1.5  # REWARD strategic hazard setup
                 # Note: Damage from hazards will add to damage_delta in future turns
         
         #momentum reward
@@ -615,7 +629,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             if recent_offense >= 3:
                 reward += 0.5  # Small bonus for maintaining pressure
                 
-        return np.clip(reward, 0.0, 4.0)  # UPDATED: Setup +3.0, hazard +2.5, momentum +0.5 = max +4.0
+        return np.clip(reward, 0.0, 3.0) 
     
     def _can_ko_opponent(self, move: Move, battle: AbstractBattle) -> bool:
         """Estimate if move can KO opponent (simplified check)"""
@@ -692,13 +706,13 @@ class ShowdownEnvironment(BaseShowdownEnv):
         our_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
         opp_hp = getattr(battle.opponent_active_pokemon, 'current_hp_fraction', 1.0) if battle.opponent_active_pokemon else 1.0
         
-        # only rewarding setup if we're healthy abd early game
-        if battle_phase < 0.2 and our_hp > 0.7 and opp_hp > 0.5: #early game
-            return 0.5 
-        elif battle_phase < 0.4 and our_hp > 0.5: 
-            return 0.0 
+        # BALANCED: Modest setup rewards (less than attacking moves)
+        if battle_phase < 0.1 and our_hp > 0.8 and opp_hp > 0.6: # Stricter early game conditions
+            return 0.3  # REDUCED from 0.5 (now less than type advantage attacking +0.6)
+        elif battle_phase < 0.3 and our_hp > 0.6: 
+            return 0.0  # Neutral (no reward for mid-game setup)
         else: 
-            return -0.8
+            return -0.6  # REDUCED penalty from -0.8 (still discourages late setup)
     
     def _get_boosted_stats(self, move_id: str) -> list[str]:
         """
