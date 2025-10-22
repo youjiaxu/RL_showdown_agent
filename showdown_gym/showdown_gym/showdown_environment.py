@@ -455,21 +455,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
                         reward += 0.15  # Moderate reward for utility
         
         
-        # RANDOM TEAM OPTIMIZED: HP management based on strategic context, not Pokemon identity
-        if battle.active_pokemon and prior_battle.active_pokemon:
-            # Check if we didn't switch (same position in battle, not same species)
-            current_is_same_position = (battle.active_pokemon == prior_battle.active_pokemon)
-            
-            if current_is_same_position:  # Same Pokemon slot, reward HP management
-                current_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
-                prior_hp = getattr(prior_battle.active_pokemon, 'current_hp_fraction', 1.0)
-                
-                # Reward HP preservation or strategic HP management
-                if current_hp > 0.7:
-                    reward += 0.05  # Bonus for staying healthy
-                elif current_hp < 0.3 and prior_hp > 0.3:
-                    # Only penalize if HP dropped to critical this turn (not pre-existing low HP)
-                    reward -= 0.03  # Reduced penalty for taking critical damage
+        # REMOVED: Micro HP preservation bonuses (+0.05, -0.03)
+        # These created noise and discouraged aggressive plays
+        # HP changes are already captured in damage_delta component
         
         # Enhanced switching incentives - reward strategic outcomes
         if (hasattr(self, 'action_history') and len(self.action_history) > 0 and 
@@ -617,65 +605,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
             elif unique_action_types == 1:
                 reward -= 0.1  # PENALTY for doing the same action type repeatedly
         
-        # === STRATEGIC DIVERSITY UTILIZATION ===
-        # RANDOM TEAM OPTIMIZED: Reward strategic diversity, not specific Pokemon usage
-        if len(self.action_history) >= 10:
-            # Track strategic patterns used instead of specific Pokemon
-            strategic_patterns = set()
-            for action in self.action_history[-10:]:
-                # Create pattern signature from strategic context
-                pattern = (
-                    action.get('action_type', 'unknown'),
-                    action.get('hp_tier', 'medium'),
-                    action.get('action_category', 'neutral'),
-                    'switch' if action.get('action_type') == 'switch' else 'stay'
-                )
-                strategic_patterns.add(pattern)
-            
-            # Reward for using diverse strategic approaches (not just different Pokemon)
-            pattern_diversity = len(strategic_patterns) / 16.0  # Max possible patterns
-            if pattern_diversity >= 0.3:  # Used at least 5 different strategic patterns
-                reward += 0.1 * pattern_diversity
-        
-        # === STRATEGIC EXPERIMENTATION ===
-        # Reward trying different move categories when safe to do so
-        current_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0) if battle.active_pokemon else 1.0
-        
-        if current_hp > 0.6:  # Only when relatively safe
-            # Check if agent is experimenting with different move types
-            if len(self.action_history) >= 3:
-                recent_move_actions = [action for action in self.action_history[-3:] 
-                                     if action.get('action_type', '').startswith('move')]
-                
-                if len(recent_move_actions) >= 2:
-                    # Small bonus for move variety when safe
-                    reward += 0.05
-        
-        # === TEMPORAL EXPLORATION ===
-        # Encourage different strategies at different battle phases
-        battle_phase = self.calculate_battle_phase(battle)
-        
-        if battle_phase < 0.3 and len(self.action_history) > 0:  # Early game
-            # Reward setup and positioning in early game
-            if self.action_history[-1].get('action_type') in ['move_stat_boost', 'switch']:
-                reward += 0.05
-        elif battle_phase > 0.7:  # Late game
-            # Reward aggressive plays in late game
-            if self.action_history[-1].get('action_type', '').startswith('move'):
-                reward += 0.05
-        
-        # === SITUATIONAL ADAPTATION ===
-        # Bonus for adapting strategy based on opponent's state
-        if battle.opponent_active_pokemon and prior_battle.opponent_active_pokemon:
-            opp_hp_current = getattr(battle.opponent_active_pokemon, 'current_hp_fraction', 1.0)
-            opp_hp_prior = getattr(prior_battle.opponent_active_pokemon, 'current_hp_fraction', 1.0)
-            
-            # If opponent is weakening, reward strategic positioning
-            if opp_hp_current < opp_hp_prior and len(self.action_history) > 0:
-                last_action_type = self.action_history[-1].get('action_type', '')
-                if last_action_type in ['switch', 'move']:  # Positioning for finish
-                    reward += 0.05
-        
         # Apply performance-based scaling
         # Reduce exploration rewards if performing very poorly
         try:
@@ -693,11 +622,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
             # Fallback: no scaling if calculation fails
             pass
         
-        # FIXED: Increased clip bounds to accommodate combined penalties
-        # Max penalty: -2.0 (consecutive boosts) + -0.1 (diversity) = -2.1
-        # Max reward: +0.3 (diversity + temporal + adaptation)
-        # Previously [-1.5, 0.3] was nullifying penalties beyond -1.5
-        return np.clip(reward, -2.5, 0.4)  # Allow full penalties
+
+        # bounds to reduce noise and improve learning stability
+        return np.clip(reward, -2.5, 0.3) 
     
     def _calculate_strategic_outcomes(self, battle: AbstractBattle, prior_battle: AbstractBattle | None) -> float:
         """
@@ -963,9 +890,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
         Returns the size of the observation size to create the observation space for all possible agents in the environment.
 
-        V3 ENHANCED Strategic state representation with type matchups and professional insights:
+        SIMPLIFIED Strategic state representation (noise reduction):
         
-        Base features (V1): 74 features
+        Base features (V1): 75 features
         - 12 (health: 6 team + 6 opponent)
         - 23 (active pokemon: 5+5 stats, 1+1 status, 5+5 boosts, 1 speed comparison)
         - 32 (moves: 4 moves × 8 features including accuracy)
@@ -981,20 +908,20 @@ class ShowdownEnvironment(BaseShowdownEnv):
         - 2 (action patterns)
         - 3 (strategic game phase indicators)
         
-        V3 strategic additions: 32 features
-        - 15 (top 3 switch options: 3 switches × 5 features)
-        - 8 (switching opportunity analysis)
-        - 3 (current pokemon threat assessment)
-        - 2 (speed tier analysis)
-        - 2 (coverage analysis)
-        - 2 (hazard/field condition awareness)
+        REMOVED V3 strategic additions (observation-reward mismatch):
+        - Switch viability scores (not directly used in rewards)
+        - Threat assessments (not directly used in rewards)
+        - Coverage analysis (not directly used in rewards)
         
-        Total: 75 + 17 + 32 = 124 features
+        These features added complexity without corresponding reward validation,
+        creating a mismatch where the agent couldn't learn to use them effectively.
+        
+        Total: 75 + 17 = 92 features (reduced from 124)
 
         Returns:
             int: The size of the observation space.
         """
-        return 124
+        return 92 
 
     def move_effectiveness(self, attacker_type: str, defender_types: Tuple[str, ...]) -> float:
         """Calculate type effectiveness with safety checks"""
@@ -1823,227 +1750,19 @@ class ShowdownEnvironment(BaseShowdownEnv):
         late_game = 1.0 if getattr(battle, 'turn', 0) > 25 else 0.0
         state.extend([early_game, mid_game, late_game])  # 3 values
 
-        # === V3 ENHANCED STRATEGIC FEATURES ===
+        # === REMOVED V3 ENHANCED STRATEGIC FEATURES ===
+        # These 32 features created observation-reward mismatch
+        # The rewards don't validate switch viability, threat assessments, or coverage analysis
+        # Removing them reduces noise and improves learning efficiency
         
-        # STRATEGIC SWITCH ANALYSIS (Team-Order Independent)
-        # Instead of position-based features, we analyze switching patterns that work universally
-        
-        # BEST AVAILABLE SWITCHES (sorted by quality, not position) - 15 values
-        # This tells the agent "your best switch option has X advantage" regardless of team order
-        available_switches = [pokemon for pokemon in battle_team.values() 
-                            if pokemon and not getattr(pokemon, 'fainted', True) and pokemon != battle.active_pokemon]
-        
-        if available_switches and battle.opponent_active_pokemon:
-            # Calculate viability for all switches and sort by quality
-            switch_scores = []
-            for pokemon in available_switches:
-                viability = self.calculate_switch_viability(pokemon, battle)
-                type_eff = self.calculate_pokemon_type_effectiveness(pokemon, battle.opponent_active_pokemon)
-                speed_adv = 1.0 if self.is_faster(pokemon, battle.opponent_active_pokemon) else 0.0
-                hp_fraction = getattr(pokemon, 'current_hp_fraction', 0.0)
-                
-                # Comprehensive switch score
-                comprehensive_score = (viability * 0.4 + 
-                                     min(type_eff / 4.0, 1.0) * 0.3 + 
-                                     speed_adv * 0.2 + 
-                                     hp_fraction * 0.1)
-                
-                switch_scores.append({
-                    'score': comprehensive_score,
-                    'type_advantage': min(type_eff / 4.0, 1.0),
-                    'speed_advantage': speed_adv,
-                    'hp_fraction': hp_fraction,
-                    'viability': viability
-                })
-            
-            # Sort by comprehensive score (best switches first)
-            switch_scores.sort(key=lambda x: x['score'], reverse=True)
-            
-            # Features for top 3 switch options (regardless of team position)
-            switch_features = []
-            for i in range(3):  # Top 3 switches
-                if i < len(switch_scores):
-                    score_data = switch_scores[i]
-                    switch_features.extend([
-                        score_data['score'],           # Overall switch quality
-                        score_data['type_advantage'],  # Type effectiveness 
-                        score_data['speed_advantage'], # Speed control
-                        score_data['hp_fraction'],     # Health status
-                        score_data['viability']        # Battle readiness
-                    ])  # 5 values per switch
-                else:
-                    switch_features.extend([0.0, 0.0, 0.0, 0.0, 0.0])  # No switch available
-            
-            state.extend(switch_features)  # 15 values
-            
-        else:
-            # No switches available or no opponent
-            state.extend([0.0] * 15)
-        
-        # SWITCHING OPPORTUNITY ANALYSIS (Position-Independent) - 8 values
-        # These features help agent recognize WHEN to switch, not WHICH pokemon to switch to
-        
-        # Current disadvantage level (should I switch?)
-        current_disadvantage = 0.0
-        if battle.active_pokemon and battle.opponent_active_pokemon:
-            our_type_eff = self.calculate_pokemon_type_effectiveness(battle.active_pokemon, battle.opponent_active_pokemon)
-            their_type_eff = self.calculate_pokemon_type_effectiveness(battle.opponent_active_pokemon, battle.active_pokemon)
-            our_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
-            our_speed = 1.0 if self.is_faster(battle.active_pokemon, battle.opponent_active_pokemon) else 0.0
-            
-            # Calculate how much trouble we're in (0 = fine, 1 = big trouble)
-            type_disadvantage = max(0, (their_type_eff - our_type_eff) / 4.0)
-            hp_concern = max(0, (0.5 - our_hp) / 0.5)  # Concern increases as HP drops below 50%
-            speed_disadvantage = 1.0 - our_speed
-            
-            current_disadvantage = np.clip((type_disadvantage * 0.5 + hp_concern * 0.3 + speed_disadvantage * 0.2), 0.0, 1.0)
-        
-        # Switch improvement potential (how much better could we be?)
-        switch_improvement = 0.0
-        if available_switches and battle.opponent_active_pokemon and battle.active_pokemon:
-            current_matchup_score = self.calculate_switch_viability(battle.active_pokemon, battle)
-            best_switch_score = max(self.calculate_switch_viability(pokemon, battle) for pokemon in available_switches)
-            switch_improvement = np.clip(best_switch_score - current_matchup_score, 0.0, 1.0)
-        
-        # Switching safety (can we switch safely?)
-        switching_safety = 0.5  # Default neutral
-        if battle.active_pokemon and battle.opponent_active_pokemon:
-            our_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
-            # Switching is safer when we have more HP or when opponent can't KO us
-            if our_hp > 0.7:
-                switching_safety = 0.8  # Safe to switch
-            elif our_hp < 0.3:
-                switching_safety = 0.2  # Risky to switch
-        
-        # Team depth (how many viable switches do we have?)
-        team_depth = len(available_switches) / 5.0  # Normalize to 0-1
-        
-        # Type coverage gap (do we need different coverage?)
-        coverage_gap = 0.0
-        if battle.opponent_active_pokemon and battle.active_pokemon and hasattr(battle, 'available_moves'):
-            # Check if our current moves are ineffective
-            move_effectiveness = []
-            for move in battle.available_moves[:4]:  # Check up to 4 moves
-                if hasattr(move, 'type') and move.type:
-                    try:
-                        opp_types = self._extract_pokemon_types(battle.opponent_active_pokemon)
-                        if opp_types:
-                            eff = self.move_effectiveness(move.type.name, tuple(opp_types))
-                            move_effectiveness.append(eff)
-                    except:
-                        move_effectiveness.append(1.0)
-            
-            if move_effectiveness:
-                best_move_eff = max(move_effectiveness)
-                if best_move_eff < 1.0:  # Our moves are not very effective
-                    coverage_gap = (1.0 - best_move_eff) / 2.0  # Need different coverage
-        
-        # Momentum shift potential (can switching change the flow?)
-        momentum_shift = 0.0
-        if len(self.action_history) >= 2:
-            # Check if we're in a bad pattern (taking damage, not dealing much)
-            recent_damage_taken = sum(action.get('damage_taken', 0) for action in self.action_history[-2:])
-            if recent_damage_taken > 0.3:  # Taken significant damage recently
-                momentum_shift = 0.7  # High potential for momentum shift
-        
-        # Tempo control opportunity (speed-based switching value)
-        tempo_control = 0.5
-        if available_switches and battle.opponent_active_pokemon:
-            # Check if we have faster options available
-            faster_switches = [pokemon for pokemon in available_switches 
-                             if self.is_faster(pokemon, battle.opponent_active_pokemon)]
-            if faster_switches:
-                tempo_control = 0.8  # We can gain tempo control
-            else:
-                tempo_control = 0.2  # No tempo options
-        
-        # Emergency switch need (are we about to faint?)
-        emergency_need = 0.0
-        if battle.active_pokemon:
-            our_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
-            if our_hp < 0.15:
-                emergency_need = 1.0  # Emergency switch needed
-            elif our_hp < 0.3:
-                emergency_need = 0.6  # Should consider switching
-        
-        switching_analysis = [
-            current_disadvantage,
-            switch_improvement, 
-            switching_safety,
-            team_depth,
-            coverage_gap,
-            momentum_shift,
-            tempo_control,
-            emergency_need
-        ]
-        
-        state.extend(switching_analysis)  # 8 values
-        
-        # CURRENT POKEMON THREAT ASSESSMENT (3 values)
-        # Professional players constantly evaluate offensive/defensive/speed threats
-        offensive_threat, defensive_threat, speed_threat = self.analyze_threat_level(battle)
-        state.extend([offensive_threat, defensive_threat, speed_threat])  # 3 values
-        
-        # SPEED TIER ANALYSIS (2 values)
-        # Critical for competitive play - understanding speed control
-        if battle.active_pokemon and battle.opponent_active_pokemon:
-            our_speed = self.calculate_stat(battle.active_pokemon, 'spe')
-            opp_speed = self.calculate_stat(battle.opponent_active_pokemon, 'spe')
-            
-            # Speed advantage margin (how much faster/slower are we?)
-            speed_ratio = our_speed / max(opp_speed, 1)
-            speed_margin = np.clip((speed_ratio - 1.0) / 2.0 + 0.5, 0.0, 1.0)  # Normalize around 0.5
-            
-            # Speed control importance (more important in late game)
-            battle_phase = self.calculate_battle_phase(battle)
-            speed_importance = battle_phase * 0.7 + 0.3  # Scale from 0.3 to 1.0
-            
-            state.extend([speed_margin, speed_importance])  # 2 values
-        else:
-            state.extend([0.5, 0.5])  # Default values
-        
-        # COVERAGE ANALYSIS (2 values)
-        # How well can we handle the current threat with moves vs switches?
-        move_coverage, switch_coverage = self.analyze_coverage_options(battle)
-        state.extend([move_coverage, switch_coverage])  # 2 values
-        
-        # HAZARD AND FIELD CONDITION AWARENESS (2 values)
-        # Professional players track hazards and field effects
-        
-        # Entry hazards approximation (simplified - would need more battle state tracking)
-        # For now, estimate based on turn count and opponent behavior
-        battle_turn = getattr(battle, 'turn', 0)
-        hazard_likelihood = min(battle_turn / 30.0, 0.8)  # Hazards more likely as battle progresses
-        
-        # Field condition assessment (weather, terrain effects)
-        field_advantage = 0.5  # Default neutral
-        if battle.weather:
-            # Simplified field advantage based on our active pokemon's typing
-            if battle.active_pokemon:
-                our_types = self._extract_pokemon_types(battle.active_pokemon)
-                weather_str = str(battle.weather).lower()
-                
-                for ptype in our_types:
-                    if ('sun' in weather_str and ptype.lower() == 'fire') or \
-                       ('rain' in weather_str and ptype.lower() == 'water'):
-                        field_advantage = 0.8  # Weather helps us
-                        break
-                    elif ('sun' in weather_str and ptype.lower() == 'water') or \
-                         ('rain' in weather_str and ptype.lower() == 'fire'):
-                        field_advantage = 0.2  # Weather hurts us
-                        break
-        
-        state.extend([hazard_likelihood, field_advantage])  # 2 values
-
         #########################################################################################################
-        # V3 FULLY RANDOM-TEAM OPTIMIZED Enhanced state calculation:
+        # SIMPLIFIED RANDOM-TEAM OPTIMIZED State calculation:
         # V1 Base: 12 + 23 + 32 + 2 + 1 + 4 + 1 = 75 features
         # V2 Temporal: 9 (action history) + 1 (battle phase) + 2 (momentum) + 2 (patterns) + 3 (game phase) = 17 features
-        # V3 Strategic: 15 (top 3 switches) + 8 (switch analysis) + 3 (threat assessment) + 2 (speed) + 2 (coverage) + 2 (hazards) = 32 features
-        # TOTAL: 75 + 17 + 32 = 124 features
+        # REMOVED V3 Strategic: 32 features (observation-reward mismatch)
+        # TOTAL: 75 + 17 = 92 features (NOTE: This is 92 not 91, will update _observation_size)
         #
         # RANDOM TEAM OPTIMIZATIONS APPLIED:
-        # ✅ Team-order independent switch analysis (quality-based ranking, not positions)
         # ✅ Strategic action tracking (context-based, not Pokemon species)  
         # ✅ Type-based opponent learning (transferable patterns, not species memory)
         # ✅ Position-based damage tracking (slot comparison, not species matching)
