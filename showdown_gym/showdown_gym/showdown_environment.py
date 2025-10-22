@@ -309,7 +309,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         total_reward += spam_penalty
         
 
-        total_reward = np.clip(total_reward, -26.0, 26.0)
+        total_reward = np.clip(total_reward, -20.0, 20.0)
         
         # Final safety check for NaN/infinity
         if not np.isfinite(total_reward):
@@ -431,19 +431,19 @@ class ShowdownEnvironment(BaseShowdownEnv):
                                 if opp_types and hasattr(move_used, 'type') and move_used.type:
                                     effectiveness = self.move_effectiveness(move_used.type.name.title(), tuple(opp_types))
                                     
-                                    # Massive penalty for immune moves
+                                    # STABLE: Moderate penalties for immune moves (clear signal, not extreme)
                                     if effectiveness == 0.0:
-                                        reward -= 2.5
-                                    # Strong penalty for resisted moves
+                                        reward -= 1.5  # REDUCED from -2.5 (strong but learnable)
+                                    # Moderate penalty for resisted moves  
                                     elif effectiveness < 0.5:
-                                        reward -= 1.0 
+                                        reward -= 0.6  # REDUCED from -1.0 (clear negative signal)
                                     elif effectiveness < 1.0:
-                                        reward -= 0.3 
-
+                                        reward -= 0.2  # REDUCED from -0.3 (mild disadvantage)
+                                    # BALANCED: Good type matchups (clear positive signal)
                                     elif effectiveness >= 2.0:
-                                        reward += 0.8
+                                        reward += 0.6  # REDUCED from +0.8 (good but not extreme)
                                     elif effectiveness > 1.0:
-                                        reward += 0.4
+                                        reward += 0.3  # REDUCED from +0.4 (consistent advantage)
                             except:
                                 pass
                     
@@ -486,21 +486,22 @@ class ShowdownEnvironment(BaseShowdownEnv):
                     if type_count > 0:
                         avg_effectiveness = total_effectiveness / type_count 
                         
-                        if avg_effectiveness >= 2.0:
-                            reward += 1.8 
-                        elif avg_effectiveness >= 1.5: 
-                            reward += 1.2 
-                        elif avg_effectiveness > 1.2: 
-                            reward += 0.8 
-                        elif avg_effectiveness >= 0.9:
+                        # STABLE: Moderate type matchup learning signals (clear but not extreme)
+                        if avg_effectiveness >= 2.0:  # Super effective (2x or 4x)
+                            reward += 1.2  # REDUCED from 1.8 (excellent switch, moderate reward)
+                        elif avg_effectiveness >= 1.5:  # Strong advantage
+                            reward += 0.8  # REDUCED from 1.2 (good strategic switch)
+                        elif avg_effectiveness > 1.2:  # Moderate advantage
+                            reward += 0.5  # REDUCED from 0.8 (decent switch)
+                        elif avg_effectiveness >= 0.9:  # Neutral matchup
                             if prior_hp_fraction < 0.3:
-                                reward += 0.6
+                                reward += 0.4  # REDUCED from 0.6 (emergency escape OK)
                             else:
-                                reward -= 0.2 
-                        elif avg_effectiveness >= 0.75: 
-                            reward -= 0.8 
-                        elif avg_effectiveness < 0.75:
-                            reward -= 1.5 
+                                reward -= 0.1  # REDUCED from -0.2 (mild discouragement)
+                        elif avg_effectiveness >= 0.75:  # Slight disadvantage
+                            reward -= 0.5  # REDUCED from -0.8 (clear but not harsh)
+                        elif avg_effectiveness < 0.75:  # Major disadvantage
+                            reward -= 0.8  # REDUCED from -1.5 (strong but learnable penalty) 
         
         return np.clip(reward, -2.0, 2.5)
     
@@ -675,17 +676,17 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if not affected_stats:
             return -1.0  # Unknown stat boost moves are discouraged
         
-        # CRITICAL: Prevent stat boost spam by checking for maxed/high stats
+        # STABLE: Moderate stat boost spam prevention (clear but not extreme)
         for stat in affected_stats:
             current_boost = active_boosts.get(stat, 0)
-            if current_boost >= 6:  
-                return -4.0 
-            elif current_boost >= 4:
-                return -2.5
-            elif current_boost >= 2:
-                return -1.5
-            elif current_boost >= 1:
-                return -0.8
+            if current_boost >= 6:  # Already at maximum (+6 is cap)
+                return -2.5  # REDUCED from -4.0 (strong signal, not crushing)
+            elif current_boost >= 4:  # High boosts (diminishing returns)
+                return -1.5  # REDUCED from -2.5 (clear negative signal)
+            elif current_boost >= 2:  # Moderate boosts (getting redundant)
+                return -0.8  # REDUCED from -1.5 (mild discouragement)
+            elif current_boost >= 1:  # Some boosts (careful not to over-boost)
+                return -0.4  # REDUCED from -0.8 (gentle warning)
         
         # Check if we have HP advantage
         our_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
@@ -851,18 +852,18 @@ class ShowdownEnvironment(BaseShowdownEnv):
         poison_moves = {'toxic', 'poisongas', 'poisonpowder', 'sludgebomb', 'toxicspikes'}
         freeze_moves = {'icebeam', 'blizzard', 'freezedry'}
         
-        # CRITICAL PENALTY: Using status move on already-affected opponent
+        # STABLE PENALTY: Using status move on already-affected opponent (clear but not extreme)
         if opponent_status_name:
             if move_id in paralysis_moves and opponent_status_name == 'par':
-                return -1.5  # HEAVY penalty for paralyzing paralyzed opponent
+                return -1.0 
             elif move_id in sleep_moves and opponent_status_name == 'slp':
-                return -1.5  # HEAVY penalty for sleeping sleeping opponent  
+                return -1.0  
             elif move_id in burn_moves and opponent_status_name == 'brn':
-                return -1.5  # HEAVY penalty for burning burned opponent
+                return -1.0  
             elif move_id in poison_moves and opponent_status_name in ['psn', 'tox']:
-                return -1.5  # HEAVY penalty for poisoning poisoned opponent
+                return -1.0  
             elif move_id in freeze_moves and opponent_status_name == 'frz':
-                return -1.5  # HEAVY penalty for freezing frozen opponent
+                return -1.0  
         
         # REWARD: Using status move on healthy opponent (strategic value)
         if not opponent_status_name:
