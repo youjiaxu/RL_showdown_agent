@@ -46,7 +46,7 @@ python run.py train cli --gym showdown --domain random --task max DQN --display 
 
 #Rainbow DQN
 # BALANCED EXPLORATION (Optimized for Move Discovery & Strategic Learning)  
-python run.py train cli --gym showdown --domain random --task max Rainbow --batch_size 96 --lr 0.00125 --start_epsilon 1.0 --end_epsilon 0.05 --decay_steps 200000 --number_steps_per_evaluation 2000 --target_update_freq 1000 --buffer_size 100000 --save_train_checkpoints 1
+python run.py train cli --gym showdown --domain random --task max Rainbow --batch_size 96 --lr 0.0015 --start_epsilon 1.0 --end_epsilon 0.05 --decay_steps 75000 --number_steps_per_evaluation 2000 --target_update_freq 1000 --buffer_size 50000 --save_train_checkpoints 1
 
 #DQN 
 python run.py train cli --gym showdown --domain random --task max DQN --batch_size 96 --lr 0.0015 --start_epsilon 1.0 --end_epsilon 0.08 --decay_steps 100000 --number_steps_per_evaluation 2000 --target_update_freq 1000 --buffer_size 100000 --save_train_checkpoints 1
@@ -203,10 +203,6 @@ python run.py resume --data_path "C:\Users\Youjia\cares_rl_logs\Rainbow\Rainbow-
 ```powershell
 # Navigate to your saved model directory
 cd "C:\Users\Youjia\cares_rl_logs\Rainbow\Rainbow-random-max-YY_MM_DD_HH-MM-SS"
-
-# Edit train_config.json to increase episode limit
-notepad train_config.json
-# Change: "max_episodes": 20000 → "max_episodes": 30000
 
 # Then resume training
 python run.py resume --data_path "." --seed 42
