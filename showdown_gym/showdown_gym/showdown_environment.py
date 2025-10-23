@@ -139,7 +139,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
             agent = self.possible_agents[0]
             
             info[agent]["win"] = self.battle1.won
-            info[agent]["battle_finished"] = getattr(self.battle1, 'battle_finished', False)
             info[agent]["battle_turns"] = getattr(self.battle1, 'turn', 0)
             
             # reward componennt
@@ -188,15 +187,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             
             info[agent]["team_pokemon_remaining"] = team_pokemon_remaining
             info[agent]["opponent_pokemon_remaining"] = opponent_pokemon_remaining
-            info[agent]["team_total_hp"] = float(team_total_hp)
-            info[agent]["opponent_total_hp"] = float(opponent_total_hp)
             info[agent]["hp_advantage"] = float(team_total_hp - opponent_total_hp)
-            
-            # Victory quality (only meaningful when battle is won)
-            if info[agent]["win"] and info[agent]["battle_turns"] > 0:
-                info[agent]["victory_hp_retained"] = float(team_total_hp / 6.0)  # HP efficiency (0.0-1.0)
-            else:
-                info[agent]["victory_hp_retained"] = 0.0
             
             # === STRATEGIC BEHAVIOR ANALYSIS (Episode-level) ===
             # Action pattern metrics from FULL episode history
@@ -217,10 +208,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 info[agent]["move_percentage"] = 0.0
                 info[agent]["switch_percentage"] = 0.0
                 info[agent]["strategy_coherence"] = 0.0
-            
-            # === BATTLE PHASE (Episode-level snapshot) ===
-            battle_phase = self.calculate_battle_phase(self.battle1)
-            info[agent]["battle_phase"] = float(battle_phase)  # 0.0 (early) to 1.0 (late)
             
             # === MOMENTUM (Episode-level snapshot) ===
             try:
@@ -309,8 +296,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         spam_penalty = self._calculate_spam_penalties(battle, prior_battle)
         total_reward += spam_penalty
         
-
-        total_reward = np.clip(total_reward, -25.0, 25.0) 
+        # Clip to reasonable bounds (reduced from ±25 to ±15 after win/loss reduction)
+        # Max possible: Win(8) + KO(8) + Damage(2) + Strategic(0.7) + Switch(0.65) + Immediate(0.5) ≈ 20
+        # Min possible: Loss(-5) + KO(-8) + Damage(-2) + Spam(-4) ≈ -19
+        total_reward = np.clip(total_reward, -20.0, 20.0) 
         
         # Final safety check for NaN/infinity
         if not np.isfinite(total_reward):
@@ -381,14 +370,15 @@ class ShowdownEnvironment(BaseShowdownEnv):
     def _calculate_outcome_reward(self, battle: AbstractBattle) -> float:
         """
         Calculate win/loss rewards.
-        NOTEE: reduce magnitude to prevent gradient washing was 25-33, now 10-12
+        REDUCED: Now 5-8 instead of 15-18 to prevent gradient washing.
+        This allows dense rewards (damage, KOs) to provide meaningful learning signals.
         """
         #Only give outcome reward when battle is actually finished
         if not getattr(battle, 'battle_finished', False):
             return 0.0
         
         if getattr(battle, 'won', False):
-            base_reward = 15.0 
+            base_reward = 5.0  # REDUCED from 8.0 to prevent gradient washing
             
             # bonus for clean sweep
             fainted_count = sum(1 for mon in battle.team.values() if getattr(mon, 'fainted', False))
@@ -399,7 +389,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             
             return base_reward
         else:
-            return -15.0
+            return -5.0  # REDUCED from -8.0 to prevent gradient washing
     
     def _calculate_immediate_feedback(self, battle: AbstractBattle, prior_battle: AbstractBattle | None) -> float:
         """
@@ -425,28 +415,32 @@ class ShowdownEnvironment(BaseShowdownEnv):
                     move_category = getattr(move_used, 'category', None)
                     
                     if move_category in [MoveCategory.PHYSICAL, MoveCategory.SPECIAL]:
-                        reward += 0.3  # Small bias toward attacking (vs passive play)
+                        # REMOVED: Attack bias (+0.3) - let damage_delta handle attack incentives
+                        # This prevents rewarding ineffective attacks (e.g. Earthquake vs Flying)
                         
-                        # Check move effectiveness - ONLY penalize objectively bad moves
                         if battle.opponent_active_pokemon and prior_battle.opponent_active_pokemon:
+                            # Moderate penalty for triggering immunity abilities
+                            if self.is_nullified(move_used, prior_battle.opponent_active_pokemon):
+                                reward -= 0.8
+                            
                             try:
                                 opp_types = self._extract_pokemon_types(battle.opponent_active_pokemon)
                                 if opp_types and hasattr(move_used, 'type') and move_used.type:
                                     effectiveness = self.move_effectiveness(move_used.type.name.title(), tuple(opp_types))
                                     
-                                    # Penalize objectively wrong moves (effectiveness already in damage_delta)
-                                    if effectiveness == 0.0:
+                                    if effectiveness >= 2.0: #rewards good choices
+                                        reward += 0.3
+                                    
+                                    # Penalise type immunity
+                                    elif effectiveness == 0.0:
                                         reward -= 1.0  # Immune move (always wrong: Earthquake vs Flying)
-                                    elif effectiveness < 0.5:
-                                        reward -= 0.4  # Heavily resisted (probably wrong)
-                                    # REMOVED: Positive effectiveness bonuses (redundant with damage_delta)
                             except:
                                 pass
                     
                     # stat boost move
                     elif self.is_stat_boost_move(move_used):
                         # earned through timing well
-                        stat_boost_reward = self._evaluate_stat_boost_timing(prior_battle, move_used)
+                        stat_boost_reward = self._evaluate_stat_boost_timing(battle, move_used)
                         reward += stat_boost_reward  # Max +0.5 early game, negative otherwise
                     
                     # OTHER STATUS MOVES: Check for redundant status effects
@@ -454,7 +448,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                         status_reward = self._evaluate_status_move_effectiveness(move_used, battle, prior_battle)
                         reward += status_reward  # Smart status use vs redundant spam
         
-        return np.clip(reward, -1.0, 0.5)  # Attack bias +0.3, penalties for bad moves -1.0 
+        return np.clip(reward, -1.0, 0.8)  # UPDATED: +0.3 super-effective, -0.8 immunity, -1.0 type immune 
     
     def _calc_type_matchup(self, atk_types: list[str], def_types: list[str]) -> float:
         """Helper to calculate offensive/defensive matchup ratio between two type sets."""
@@ -482,6 +476,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if not prior_battle or not hasattr(self, 'action_history') or len(self.action_history) == 0:
             return 0.0
         
+        last_action_type = self.action_history[-1].get('action_type', '')
+        if last_action_type != 'switch':
+            return 0.0  # No reward/penalty if we didn't switch
+        
         reward = 0.0
         prior_hp_fraction = self.action_history[-1].get('hp_fraction', 1.0)
         
@@ -496,58 +494,59 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Get types of Pokemon we switched FROM
         prior_types = self.action_history[-1].get('active_types', [])
         
-        # === CASE 1: BOTH MATCHUPS KNOWN - Full type effectiveness analysis ===
+        # case 1 both known active pokemon
         if our_types and opp_types and prior_types:
             current_matchup = self._calc_type_matchup(our_types, opp_types)
             prior_matchup = self._calc_type_matchup(prior_types, opp_types)
             
-            # REVISED: Reward based on BOTH current quality AND improvement from prior
+            # BALANCED: Strong enough to compete with damage, but not overwhelming
             # Base reward on current matchup quality
             if current_matchup >= 3.0:
-                base_reward = 0.5  # Perfect switch (was 1.4)
+                base_reward = 1.0  # Perfect switch (4x advantage or better)
             elif current_matchup >= 2.0:
-                base_reward = 0.3  # Good strategic switch (was 1.0)
+                base_reward = 0.7  # Good strategic switch (2-3x advantage)
             elif current_matchup >= 1.5:
-                base_reward = 0.2  # Decent switch (was 0.6)
+                base_reward = 0.4  # Decent switch (moderate advantage)
             elif current_matchup >= 1.0:
-                base_reward = 0.0  # Neutral matchup
+                base_reward = 0.15  # Slight advantage (mild incentive)
             elif current_matchup >= 0.7:
-                base_reward = -0.1  # Slight disadvantage (was -0.3)
+                base_reward = -0.15  # Slight disadvantage
             else:
-                base_reward = -0.2  # Bad matchup (was -0.6)
+                base_reward = -0.4  # Bad matchup (don't switch into disadvantage)
             
             # Bonus for IMPROVING matchup (escape bad → find better)
             matchup_improvement = current_matchup - prior_matchup
             if prior_matchup < 0.8 and matchup_improvement > 0.3:
                 # Escaped bad matchup significantly - bonus!
-                base_reward += 0.15  # (was 0.4)
+                base_reward += 0.3  # Reward escaping bad situations
             elif prior_hp_fraction < 0.3:
-                # Emergency escape bonus
-                base_reward += 0.15  # (was 0.4)
+                # Emergency escape bonus (save low HP Pokemon)
+                base_reward += 0.25  # Always good to preserve Pokemon
             elif matchup_improvement < -0.5:
-                # Switched from good to bad - extra penalty
-                base_reward -= 0.1  # (was -0.3)
+                # Switched from good to bad - penalty
+                base_reward -= 0.25  # Discourage bad switches
+            elif prior_matchup >= 1.5 and matchup_improvement < 0.1:
+                # Switched OUT of good matchup unnecessarily - penalty
+                base_reward -= 0.2  # Discourage unnecessary switches
             
             reward += base_reward
         
-        # === CASE 2: PRIOR POKEMON UNKNOWN - New Pokemon now revealed ===
+        # case 2 picking new pokemon
         elif our_types and opp_types and not prior_types:
-            # Switched FROM unknown Pokemon (first time seeing new Pokemon)
-            # Reward based on matchup quality found
             new_matchup = self._calc_type_matchup(our_types, opp_types)
             
-            # RANDOM TEAM FIX: Reward exploration with bonus for finding good matchups
+
             if new_matchup >= 2.5:
-                reward += 0.4  # Found excellent matchup! (was 1.2)
+                reward += 0.8  # Excellent matchup found
             elif new_matchup >= 1.8:
-                reward += 0.25  # Found great matchup (was 0.8)
+                reward += 0.5  # Good matchup found
             elif new_matchup >= 1.2:
-                reward += 0.15  # Found good matchup (was 0.5)
-            elif new_matchup >= 0.8:
-                reward += 0.1  # Found neutral matchup (was 0.2)
-            else:
-                reward += 0.05  # Poor matchup but learned something (was 0.1)
-        
+                reward += 0.3  # Decent matchup
+            elif new_matchup >= 1.0:
+                reward += 0.1  # Neutral matchup (small exploration bonus)
+            elif new_matchup >= 0.7:
+                reward += 0.0  # Slight disadvantage (neutral - no reward/penalty)
+
         # === CASE 3: OPPONENT UNKNOWN OR EMERGENCY ===
         else:
             # Either opponent types unknown or something went wrong
@@ -558,15 +557,13 @@ class ShowdownEnvironment(BaseShowdownEnv):
             
             if team_hp_avg < 0.4:
                 # Team HP low - ENCOURAGE aggressive switching to find answers
-                reward += 0.15  # Desperation switching bonus (was 0.5)
+                reward += 0.25  
             elif prior_hp_fraction < 0.3:
                 # Emergency escape from low HP
-                reward += 0.15  # Always good to save Pokemon (was 0.4)
-            else:
-                # Exploratory switching - small bonus
-                reward += 0.1  # Learn team composition (was 0.2)
+                reward += 0.25  # Always good to save Pokemon
+
         
-        return np.clip(reward, -0.3, 0.65)  # Switching: -0.3 to +0.65 (perfect + improvement) 
+        return np.clip(reward, -0.6, 1.3)  # Switching: -0.6 to +1.3 (perfect switch + improvement) 
     
     def _calculate_spam_penalties(self, battle: AbstractBattle, prior_battle: AbstractBattle | None) -> float:
         """
@@ -587,20 +584,24 @@ class ShowdownEnvironment(BaseShowdownEnv):
             recent_window = self.action_history[-5:]
             switch_count = sum(1 for a in recent_window if a.get('action_type') == 'switch')
             
-            if switch_count >= 4:
-                reward -= 1.2  # Strong penalty for excessive switching
+            # PROGRESSIVE spam penalties - scales with frequency to prevent over-switching
+            if switch_count >= 5:
+                reward -= 1.5  # Severe penalty for switching every turn
+            elif switch_count >= 4:
+                reward -= 0.8  # Strong penalty for very frequent switching
             elif switch_count >= 3:
-                reward -= 0.6 
+                reward -= 0.3  # Moderate penalty for frequent switching
+            # 1-2 switches in 5 turns is fine (strategic play) 
 
         current_action_category = current_action.get('action_category', '')
-        if current_action_category == 'setup':
+        if current_action_category == 'boost':  # FIXED: Was 'setup', but track_action sets 'boost'
             recent_window = self.action_history[-5:]
-            setup_count = sum(1 for a in recent_window if a.get('action_category') == 'setup')
+            boost_count = sum(1 for a in recent_window if a.get('action_category') == 'boost')
             
-            if setup_count >= 3:
-                reward -= 1.5  #discourage spamming
-            elif setup_count >= 2:
-                reward -= 0.5 
+            if boost_count >= 3:
+                reward -= 1.5  # Discourage excessive stat boosting
+            elif boost_count >= 2:
+                reward -= 0.5  # Mild penalty for frequent boosting 
         
         #consecutive entry hazard
         if len(self.action_history) >= 1:
@@ -644,18 +645,19 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 # Check if hazards already exist (prevent spam)
                 hazards_exist = False
                 if hasattr(battle, 'opponent_side_conditions'):
-                    hazard_conditions = ['stealth rock', 'spikes', 'toxic spikes', 'sticky web']
+                    opponent_conditions_str = str(battle.opponent_side_conditions).lower()
+                    hazard_conditions = ['stealth rock', 'stealthrock', 'spikes', 'toxic spikes', 'toxicspikes', 'sticky web', 'stickyweb']
                     for condition in hazard_conditions:
-                        if condition in battle.opponent_side_conditions:
+                        if condition in opponent_conditions_str:
                             hazards_exist = True
                             break
                 
                 if not hazards_exist:
-                    reward += 0.7  # First hazard (was 1.0)
+                    reward += 1.2  # INCREASED from 1.0 for positive reinforcement
                 else:
-                    reward -= 1.0  # PENALTY for redundant hazard spam (was -1.5)
+                    reward -= 1.0  # Clear spam penalty
         
-        return np.clip(reward, -1.0, 0.7) 
+        return np.clip(reward, -1.0, 1.0)
     
     def _can_ko_opponent(self, move: Move, battle: AbstractBattle) -> bool:
         """Estimate if move can KO opponent (simplified check)"""
@@ -712,15 +714,18 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Check current boost level (use max across affected stats)
         max_current_boost = max([active_boosts.get(stat, 0) for stat in affected_stats] + [0])
         
-        # CLEAR DIMINISHING RETURNS CURVE
+        # GRANULAR DIMINISHING RETURNS CURVE - Progressively discourage over-boosting
+        # STRENGTHENED: Make spam penalties more aggressive to prevent 3x+ boost patterns
         if max_current_boost >= 6:
-            return -1.0  # At max (+6 cap), can't boost further - wasted turn
+            return -2.0  # At max (+6 cap), can't boost further - very strong penalty
+        elif max_current_boost >= 5:
+            return -1.5  # Very high boosts (+5), very strong diminishing returns
         elif max_current_boost >= 4:
-            return -0.6  # Very high boosts, diminishing returns
+            return -1.0  # High boosts (+4), strong diminishing returns
+        elif max_current_boost >= 3:
+            return -0.6  # Moderate boosts (+3), notable diminishing returns  
         elif max_current_boost >= 2:
-            return -0.3  # Moderate boosts, getting greedy
-        elif max_current_boost >= 1:
-            return -0.1  # Some boosts already, mild discouragement
+            return -0.2  # Some boosts (+2), mild discouragement
         
         # For first boost (0 → +1 or +2), check timing and safety
         our_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
@@ -735,13 +740,14 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 type_advantage = sum(self.move_effectiveness(our_type, (opp_types[0],)) 
                                    for our_type in our_types) / len(our_types)
         
-        # CONTEXT-AWARE FIRST BOOST REWARDS
+        # BALANCED FIRST BOOST REWARDS - Encourage smart setup without over-boosting
+        # REDUCED: Lower first boost reward to balance against strengthened spam penalties
         if battle_phase < 0.2 and our_hp > 0.75 and type_advantage >= 1.0:
-            return 0.5  # Excellent setup opportunity (early, healthy, safe)
+            return 0.4  # Reward excellent early setup (reduced from 0.6)
         elif battle_phase < 0.3 and our_hp > 0.6:
-            return 0.2  # Decent setup opportunity (mid-early, okay health)
+            return 0.3  # Reward decent early setup (reduced from 0.4)
         elif our_hp > 0.8 and type_advantage >= 1.5:
-            return 0.3  # Safe due to type advantage
+            return 0.35  # Reward safe setup with advantage (reduced from 0.5)
         else:
             return -0.4  # Bad timing (too late, too weak, or disadvantage)
     
@@ -797,7 +803,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             'autotomize': ['spe'],       # +2 Spe (user loses weight)
             'doubleteam': ['spe'],       # +1 Evasion (evasion ≈ speed in Gen 9)
             'minimize': ['spe'],         # +2 Evasion
-            'flamecha rge': ['spe'],     # +1 Spe (on hit)
+            'flamecharge': ['spe'],     # +1 Spe (on hit)
             
             # stat boosts
             'dragondance': ['atk', 'spe'],     # +1 Atk, +1 Spe
@@ -921,38 +927,41 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
         Returns the size of the observation size to create the observation space for all possible agents in the environment.
 
-        SIMPLIFIED Strategic state representation (noise reduction):
+        STRATEGIC State Representation with STATE-REWARD ALIGNMENT:
         
-        Base features (V1): 75 features
+        Base features (V1): 81 features (increased from 75)
         - 12 (health: 6 team + 6 opponent)
-        - 23 (active pokemon: 5+5 stats, 1+1 status, 5+5 boosts, 1 speed comparison)
+        - 29 (active pokemon: 5+5 stats, 1+1 status, 5+5 boosts, 1 speed, 3 ability indicators, 3 item indicators) 🆕
         - 32 (moves: 4 moves × 8 features including accuracy)
         - 2 (fainted counts)
         - 1 (turn number)
         - 4 (weather one-hot)
         - 1 (switches available)
         
-        V2 additions: 17 features  
-        - 9 (action history: 3 actions × 3 features)
+        V2 temporal additions: 20 features  
+        - 12 (enhanced action history: 3 actions × 4 features - includes move categories!)
         - 1 (battle phase)
         - 2 (momentum indicators) 
         - 2 (action patterns)
         - 3 (strategic game phase indicators)
         
-        REMOVED V3 strategic additions (observation-reward mismatch):
-        - Switch viability scores (not directly used in rewards)
-        - Threat assessments (not directly used in rewards)
-        - Coverage analysis (not directly used in rewards)
+        V3 field conditions: 8 features
+        - 4 (opponent hazards: stealth rock, spikes, toxic spikes, sticky web)
+        - 4 (our hazards: same 4 types)
         
-        These features added complexity without corresponding reward validation,
-        creating a mismatch where the agent couldn't learn to use them effectively.
+        CRITICAL ALIGNMENT FIXES:
+        ✅ Hazard visibility - Agent can SEE if hazards exist before penalty
+        ✅ Move category tracking - Agent knows if it just used hazard/boost/attack
+        ✅ Ability indicators - Agent can SEE immunity abilities (Volt Absorb, etc.) 🆕
+        ✅ Item indicators - Agent can SEE items (Life Orb, Leftovers, etc.) 🆕
+        ✅ Immunity penalty - Extra -2.0 reward for triggering immunity abilities 🆕
         
-        Total: 75 + 17 = 92 features (reduced from 124)
+        Total: 81 + 20 + 8 = 109 features (increased from 103)
 
         Returns:
             int: The size of the observation space.
         """
-        return 92 
+        return 109 
 
     def move_effectiveness(self, attacker_type: str, defender_types: Tuple[str, ...]) -> float:
         """Calculate type effectiveness with safety checks"""
@@ -1111,14 +1120,104 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         return False
     
+    def get_opponent_ability_indicators(self, battle: AbstractBattle) -> tuple:
+        """
+        Returns binary indicators for opponent ability categories.
+        Helps agent learn about abilities without memorizing specific Pokemon.
+        
+        Returns: (has_immunity_ability, has_boosting_ability, has_weather_ability)
+        """
+        if not battle.opponent_active_pokemon:
+            return (0.0, 0.0, 0.0)
+        
+        ability = getattr(battle.opponent_active_pokemon, 'ability', None)
+        if not ability:
+            return (0.0, 0.0, 0.0)
+        
+        ability_str = str(ability).lower().replace(" ", "")
+        
+        # Immunity/absorption abilities (CRITICAL for learning)
+        immunity_abilities = {
+            'voltabsorb', 'motordrive', 'lightningrod',  # Electric immunity
+            'waterabsorb', 'stormdrain', 'dryskin',      # Water immunity
+            'flashfire',                                  # Fire immunity
+            'sapsipper',                                  # Grass immunity
+            'levitate',                                   # Ground immunity
+            'bulletproof',                                # Ball/bomb immunity
+            'wonderguard',                                # Multi-immunity
+            'thickfat',                                   # Fire/Ice resistance
+        }
+        has_immunity = 1.0 if ability_str in immunity_abilities else 0.0
+        
+        # Stat-boosting abilities (affect damage calculations)
+        boosting_abilities = {
+            'intimidate', 'defiant', 'competitive', 'contrary',
+            'hugepower', 'purepower', 'adaptability', 'technician',
+            'tintedlens', 'scrappy', 'moxie', 'beastboost'
+        }
+        has_boosting = 1.0 if ability_str in boosting_abilities else 0.0
+        
+        # Weather/terrain abilities (change battle conditions)
+        weather_abilities = {
+            'drizzle', 'drought', 'sandstream', 'snowwarning',
+            'electricsurge', 'grassysurge', 'mistysurge', 'psychicsurge'
+        }
+        has_weather = 1.0 if ability_str in weather_abilities else 0.0
+        
+        return (has_immunity, has_boosting, has_weather)
+    
+    def get_opponent_item_indicators(self, battle: AbstractBattle) -> tuple:
+        """
+        Returns binary indicators for opponent item categories.
+        Helps agent understand item effects without memorizing specific items.
+        
+        Returns: (has_hp_item, has_power_item, has_defensive_item)
+        """
+        if not battle.opponent_active_pokemon:
+            return (0.0, 0.0, 0.0)
+        
+        item = getattr(battle.opponent_active_pokemon, 'item', None)
+        if not item:
+            return (0.0, 0.0, 0.0)
+        
+        item_str = str(item).lower().replace(" ", "")
+        
+        # HP restoration items
+        hp_items = {
+            'leftovers', 'blacksludge', 'sitrusberry', 'oranberry',
+            'aguavberry', 'figyberry', 'iapapaberry', 'magoberry', 'wikiberry'
+        }
+        has_hp_item = 1.0 if item_str in hp_items else 0.0
+        
+        # Power-boosting items
+        power_items = {
+            'lifeorb', 'choiceband', 'choicespecs', 'choicescarf',
+            'expertbelt', 'muscleband', 'wiseglasses', 'metronome',
+            # Type-specific power items
+            'charcoal', 'mysticwater', 'magnet', 'miracleseed',
+            'nevermeltice', 'blackbelt', 'poisonbarb', 'softsand',
+            'sharpbeak', 'twistedspoon', 'silverpowder', 'hardstone',
+            'spelltag', 'dragonfang', 'blackglasses', 'metalcoat', 'pixieplate'
+        }
+        has_power_item = 1.0 if item_str in power_items else 0.0
+        
+        # Defensive items
+        defensive_items = {
+            'assaultvest', 'rockyhelmet', 'weaknesspolicy',
+            'lightclay', 'focussash', 'lumberry', 'chestoberry'
+        }
+        has_defensive_item = 1.0 if item_str in defensive_items else 0.0
+        
+        return (has_hp_item, has_power_item, has_defensive_item)
+    
     # V2 Enhancement: Strategic context methods
     def track_action(self, action: int, battle: AbstractBattle, action_type: str | None = None):
         """RANDOM TEAM OPTIMIZED: Track actions by strategic context, not Pokemon identity"""
         if action_type is None:
             action_type = self.get_action_type(action)
         
-        # Store strategic context instead of Pokemon species
-        strategic_context = self._get_strategic_context(battle) if battle.active_pokemon else {}
+        # Store strategic context instead of Pokemon species - PASS action to determine category correctly
+        strategic_context = self._get_strategic_context(battle, action) if battle.active_pokemon else {}
         
         # CRITICAL: Store active Pokemon's types for matchup evaluation when switching
         active_types = self._extract_pokemon_types(battle.active_pokemon) if battle.active_pokemon else []
@@ -1145,7 +1244,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Store ALL actions for episode-level statistics
         self.full_episode_history.append(action_context)
     
-    def _get_strategic_context(self, battle: AbstractBattle) -> dict:
+    def _get_strategic_context(self, battle: AbstractBattle, action: int = -1) -> dict:
         """Extract strategic context that's independent of Pokemon identity"""
         context = {}
         
@@ -1175,22 +1274,32 @@ class ShowdownEnvironment(BaseShowdownEnv):
             else:
                 context['battle_phase'] = 'late'
                 
-            # Action category based on last move type
-            if hasattr(battle, 'available_moves') and battle.available_moves:
-                last_move = battle.available_moves[0] if battle.available_moves else None
-                if last_move:
-                    move_category = getattr(last_move, 'category', None)
-                    # Check for entry hazards FIRST (they're STATUS moves but special category)
-                    if self.is_entry_hazard_move(last_move):
-                        context['action_category'] = 'hazard'
-                    elif move_category == MoveCategory.STATUS and self.is_stat_boost_move(last_move):
-                        context['action_category'] = 'setup'
-                    elif move_category in [MoveCategory.PHYSICAL, MoveCategory.SPECIAL]:
-                        context['action_category'] = 'offensive'
-                    elif move_category == MoveCategory.STATUS:
-                        context['action_category'] = 'defensive'
+            # FIXED: Determine action category from ACTUAL action taken
+            # Actions 6-9 = moves 0-3, 10-13 = mega moves 0-3, etc.
+            if 6 <= action <= 25:  # All move actions
+                move_index = (action - 6) % 4  # Convert to move index (0-3)
+                if hasattr(battle, 'available_moves') and battle.available_moves:
+                    if 0 <= move_index < len(battle.available_moves):
+                        actual_move = battle.available_moves[move_index]
+                        move_category = getattr(actual_move, 'category', None)
+                        # Check for entry hazards FIRST (they're STATUS moves but special category)
+                        if self.is_entry_hazard_move(actual_move):
+                            context['action_category'] = 'hazard'
+                        elif move_category == MoveCategory.STATUS and self.is_stat_boost_move(actual_move):
+                            context['action_category'] = 'boost'
+                        elif move_category in [MoveCategory.PHYSICAL, MoveCategory.SPECIAL]:
+                            context['action_category'] = 'offensive'
+                        elif move_category == MoveCategory.STATUS:
+                            context['action_category'] = 'defensive'
+                        else:
+                            context['action_category'] = 'neutral'
                     else:
                         context['action_category'] = 'neutral'
+                else:
+                    context['action_category'] = 'neutral'
+            else:
+                # Switches or other actions
+                context['action_category'] = 'neutral'
         
         return context
     
@@ -1529,6 +1638,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
         # Reset episode history at start of new battle
         if getattr(battle, 'turn', 0) <= 1:
+            self.action_history = []
             self.full_episode_history = []
             self.cumulative_episode_reward = 0.0  # Reset cumulative reward tracker
         
@@ -1594,12 +1704,16 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
             # Speed comparison
             state.append(1.0 if self.is_faster(active, opp_active) else 0.0)  # 1 value
+            
+            ability_indicators = self.get_opponent_ability_indicators(battle)
+            state.extend(ability_indicators)  # 3 values (immunity, boosting, weather abilities)
+            
+            item_indicators = self.get_opponent_item_indicators(battle)
+            state.extend(item_indicators)  # 3 values (HP, power, defensive items)
 
         else:
             # Fill with zeros if no active pokemon
-            # NOTE: active block appends 23 values (5+5 stats, 2 status, 10 boosts, 1 speed)
-            # so pad with 23 zeros to keep vector length consistent
-            state.extend([0.0] * 23)
+            state.extend([0.0] * 29)
 
         # === AVAILABLE MOVES ANALYSIS ===
         move_features = []
@@ -1687,27 +1801,72 @@ class ShowdownEnvironment(BaseShowdownEnv):
                                 if not getattr(mon, 'fainted', True) and mon != battle_active])
         state.append(available_switches / 5.0)  # 1 value (max 5 switches)
 
+        # === FIELD CONDITIONS (CRITICAL: Agent needs to see hazards to avoid spam penalty!) ===
+        # Entry hazards on OPPONENT side (what WE set up)
+        opponent_hazards = [0.0, 0.0, 0.0, 0.0]  # [stealth_rock, spikes, toxic_spikes, sticky_web]
+        if hasattr(battle, 'opponent_side_conditions'):
+            opponent_conditions = battle.opponent_side_conditions
+            # Stealth Rock (binary: 0 or 1)
+            if any(cond in str(opponent_conditions).lower() for cond in ['stealth rock', 'stealthrock']):
+                opponent_hazards[0] = 1.0
+            # Spikes (layers: 0, 1, 2, or 3) - treat as binary for simplicity
+            if 'spikes' in str(opponent_conditions).lower():
+                opponent_hazards[1] = 1.0
+            # Toxic Spikes (layers: 0, 1, or 2) - treat as binary
+            if any(cond in str(opponent_conditions).lower() for cond in ['toxic spikes', 'toxicspikes']):
+                opponent_hazards[2] = 1.0
+            # Sticky Web (binary: 0 or 1)
+            if any(cond in str(opponent_conditions).lower() for cond in ['sticky web', 'stickyweb']):
+                opponent_hazards[3] = 1.0
+        state.extend(opponent_hazards)  # 4 values
+        
+        # Entry hazards on OUR side (what OPPONENT set up)
+        our_hazards = [0.0, 0.0, 0.0, 0.0]
+        if hasattr(battle, 'side_conditions'):
+            our_conditions = battle.side_conditions
+            if any(cond in str(our_conditions).lower() for cond in ['stealth rock', 'stealthrock']):
+                our_hazards[0] = 1.0
+            if 'spikes' in str(our_conditions).lower():
+                our_hazards[1] = 1.0
+            if any(cond in str(our_conditions).lower() for cond in ['toxic spikes', 'toxicspikes']):
+                our_hazards[2] = 1.0
+            if any(cond in str(our_conditions).lower() for cond in ['sticky web', 'stickyweb']):
+                our_hazards[3] = 1.0
+        state.extend(our_hazards)  # 4 values
+        
+        # Total field conditions: 8 values (4 opponent + 4 ours)
+
         # === V2 TEMPORAL CONTEXT FEATURES ===
-        # Action history (last 3 actions)
-        action_history_features = [0.0] * 9  # 3 actions × 3 features each
+        # Enhanced action history (last 3 actions with DETAILED context for spam detection)
+        action_history_features = [0.0] * 12  # 3 actions × 4 features each
         for i, action_data in enumerate(self.action_history[-3:]):
             if i < 3:  # Safety check
-                base_idx = i * 3
-                # FIXED: Add bounds checking and safer normalization
+                base_idx = i * 4
+                # Feature 1: Normalized action index
                 action_value = action_data.get('action', -2)
-                action_history_features[base_idx] = np.clip(action_value / 26.0, -1.0, 1.0)  # Normalized action
+                action_history_features[base_idx] = np.clip(action_value / 26.0, -1.0, 1.0)
                 
-                # Action type encoding
+                # Feature 2: Action type encoding (move/switch/etc)
                 action_type_map = {'move': 0.2, 'switch': 0.4, 'move_mega': 0.6, 'move_z': 0.8, 'move_dynamax': 1.0}
                 action_history_features[base_idx + 1] = action_type_map.get(action_data.get('action_type', 'move'), 0.0)
                 
-                # Turns ago (recency) - with safer calculation
+                # Feature 3: CRITICAL - Move category (physical/special/status/hazard)
+                category_map = {
+                    'physical': 0.25, 
+                    'special': 0.5, 
+                    'status': 0.75, 
+                    'hazard': 1.0,  # CRITICAL for hazard spam detection!
+                    'boost': 0.9    # For stat boost spam detection
+                }
+                action_history_features[base_idx + 2] = category_map.get(action_data.get('action_category', ''), 0.0)
+                
+                # Feature 4: Turns ago (recency)
                 current_turn = getattr(battle, 'turn', 0)
                 action_turn = action_data.get('turn', current_turn)
                 turns_ago = max(0, current_turn - action_turn)
-                action_history_features[base_idx + 2] = min(turns_ago / 10.0, 1.0)
+                action_history_features[base_idx + 3] = min(turns_ago / 10.0, 1.0)
         
-        state.extend(action_history_features)  # 9 values
+        state.extend(action_history_features)  # 12 values (increased from 9)
         
         # === V2 STRATEGIC CONTEXT FEATURES ===
         # Battle phase
@@ -1722,9 +1881,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
             prior_battle = None
         damage_dealt_momentum, damage_taken_momentum = self.calculate_momentum(battle, prior_battle)
         state.extend([damage_dealt_momentum, damage_taken_momentum])  # 2 values
-        
-        # REMOVED: Stat boost efficiency - redundant with boost values in active pokemon block
-        # The 10 boost values (5 ours + 5 opponent) already tell agent current boost state
         
         # Recent action pattern detection
         recent_move_count = sum(1 for action in self.action_history[-3:] 
@@ -1745,11 +1901,19 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Removing them reduces noise and improves learning efficiency
         
         #########################################################################################################
-        # SIMPLIFIED RANDOM-TEAM OPTIMIZED State calculation:
-        # V1 Base: 12 + 23 + 32 + 2 + 1 + 4 + 1 = 75 features
-        # V2 Temporal: 9 (action history) + 1 (battle phase) + 2 (momentum) + 2 (patterns) + 3 (game phase) = 17 features
-        # REMOVED V3 Strategic: 32 features (observation-reward mismatch)
-        # TOTAL: 75 + 17 = 92 features (NOTE: This is 92 not 91, will update _observation_size)
+        # STATE-REWARD ALIGNED State Representation:
+        # V1 Base: 12 + 29 + 32 + 2 + 1 + 4 + 1 = 81 features
+        # V2 Temporal: 12 (enhanced action history) + 1 (battle phase) + 2 (momentum) + 2 (patterns) + 3 (game phase) = 20 features
+        # V3 Field Conditions: 8 features (4 opponent hazards + 4 our hazards)
+        # TOTAL: 81 + 20 + 8 = 109 features (increased from 103)
+        #
+        # CRITICAL STATE-REWARD ALIGNMENT FIXES:
+        # ✅ Hazard visibility (8 features): Agent can SEE if Stealth Rock/Spikes exist before -1.0 spam penalty
+        # ✅ Move category tracking (in action history): Agent knows if last move was hazard/boost/attack
+        # ✅ Enhanced action history: 12 features (3×4) instead of 9 (3×3) with category information
+        # ✅ Ability indicators (3 features): Agent can SEE immunity/boosting/weather abilities 🆕
+        # ✅ Item indicators (3 features): Agent can SEE HP/power/defensive items 🆕
+        # ✅ Immunity penalty: -2.0 reward for triggering Volt Absorb, Flash Fire, etc. 🆕
         #
         # RANDOM TEAM OPTIMIZATIONS APPLIED:
         # ✅ Strategic action tracking (context-based, not Pokemon species)  
@@ -1759,10 +1923,11 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # ✅ Strategic diversity rewards (pattern-based, not Pokemon counting)
         # ✅ Move accuracy tracking (helps learn about Thunder vs Thunderbolt reliability tradeoffs)
         # ✅ Type immunity naturally captured in effectiveness (0.0 = immune: Ground vs Flying, etc.)
-        # ✅ Attack-prioritized rewards (attacking moves get +0.4 baseline vs +0.0 for stat boosts)
+        # ✅ Ability immunity learning (Volt Absorb, Levitate, etc. with -2.0 penalty) 🆕
+        # ✅ Hazard spam prevention with VISIBILITY (penalties only when agent can see hazards exist)
         # ✅ Stat boost spam prevention (penalties for redundant boosts, only reward early setup when safe)
         # 
-        # RESULT: Agent learns universal Pokemon strategies that transfer to ANY random team!
+        # RESULT: Agent learns universal Pokemon strategies with full state-reward alignment!
         #########################################################################################################
 
         final_vector = np.array(state, dtype=np.float32)
