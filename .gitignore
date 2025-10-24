@@ -125,3 +125,8 @@ README.md
 STATE_REWARD_AUDIT.md
 SWITCHING_BUG_FIX.md
 README.md
+CRITICAL_REVIEW.py
+README.md
+REWARD_VALIDATION_SUMMARY.md
+test_final_validation.py
+test_reward_timing_audit.py
