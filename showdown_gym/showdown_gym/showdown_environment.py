@@ -296,10 +296,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         spam_penalty = self._calculate_spam_penalties(battle, prior_battle)
         total_reward += spam_penalty
         
-        # Clip to reasonable bounds (reduced from ±25 to ±15 after win/loss reduction)
-        # Max possible: Win(8) + KO(8) + Damage(2) + Strategic(0.7) + Switch(0.65) + Immediate(0.5) ≈ 20
-        # Min possible: Loss(-5) + KO(-8) + Damage(-2) + Spam(-4) ≈ -19
-        total_reward = np.clip(total_reward, -20.0, 20.0) 
+        total_reward = np.clip(total_reward, -5.0, 10.0)  # Allow strong win signal, cap per-turn negatives
+        
+        #normalised rewards
+        total_reward = total_reward / 2.0
         
         # Final safety check for NaN/infinity
         if not np.isfinite(total_reward):
@@ -329,9 +329,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
         
 
         
-        # INCREASED scaling: ±2.0 max (from ±1.5) to match new reward hierarchy
-        # Damage now worth 20% of win (2.0/10.0) instead of 6% (1.5/25.0)
-        return np.clip(advantage_delta * 2.0, -2.0, 2.0)
+
+        return np.clip(advantage_delta * 0.3, -0.3, 0.3)
     
     def _calculate_ko_reward(self, battle: AbstractBattle, prior_battle: AbstractBattle | None) -> float:
         """
@@ -355,41 +354,44 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if opponent_kos > 0:
             #early KOs worth less, late KOs worth more
             remaining_opponents = 6 - current_fainted_opponent
-            stage_multiplier = min(2.0, max(1.0, 7 - remaining_opponents))  # 1.0 to 2.0
-            reward += 4.0 * stage_multiplier * opponent_kos  # INCREASED from 3.0 (now 4.0-8.0 range)
+            stage_multiplier = min(1.5, max(0.8, 7 - remaining_opponents))  # 0.8 to 1.5
+            reward += 0.8 * stage_multiplier * opponent_kos 
         
         # Losses
         team_kos = current_fainted_team - prior_fainted_team
         if team_kos > 0:
             remaining_team = 6 - current_fainted_team
-            stage_multiplier = min(2.0, max(1.0, 7 - remaining_team))  # 1.0 to 2.0
-            reward -= 4.0 * stage_multiplier * team_kos  # INCREASED from 3.0 for symmetry
+            stage_multiplier = min(1.5, max(0.8, 7 - remaining_team))  # 0.8 to 1.5
+            reward -= 0.8 * stage_multiplier * team_kos  # GENTLE: symmetry
         
-        return np.clip(reward, -8.0, 8.0)
+        return np.clip(reward, -1.5, 1.5)
     
     def _calculate_outcome_reward(self, battle: AbstractBattle) -> float:
         """
         Calculate win/loss rewards.
-        REDUCED: Now 5-8 instead of 15-18 to prevent gradient washing.
-        This allows dense rewards (damage, KOs) to provide meaningful learning signals.
+        CRITICAL DEBUG: Logging added to verify rewards fire correctly
         """
+        battle_finished = getattr(battle, 'battle_finished', False)
+        
         #Only give outcome reward when battle is actually finished
-        if not getattr(battle, 'battle_finished', False):
+        if not battle_finished:
             return 0.0
         
-        if getattr(battle, 'won', False):
-            base_reward = 5.0  # REDUCED from 8.0 to prevent gradient washing
+        won = getattr(battle, 'won', False)
+        fainted_count = sum(1 for mon in battle.team.values() if getattr(mon, 'fainted', False))
+        
+        if won:
+            base_reward = 10.0 
             
-            # bonus for clean sweep
-            fainted_count = sum(1 for mon in battle.team.values() if getattr(mon, 'fainted', False))
+            # bonus for clean sweep (reward efficient play)
             if fainted_count == 0:
-                base_reward += 3.0
+                base_reward += 5.0  # Clean sweep = +15 total
             elif fainted_count <= 2:
-                base_reward += 1.5
+                base_reward += 2.0  # Close win = +12 total
             
             return base_reward
         else:
-            return -5.0  # REDUCED from -8.0 to prevent gradient washing
+            return -3.0  # Gentler loss penalty (contrast with win is what matters)
     
     def _calculate_immediate_feedback(self, battle: AbstractBattle, prior_battle: AbstractBattle | None) -> float:
         """
@@ -415,13 +417,31 @@ class ShowdownEnvironment(BaseShowdownEnv):
                     move_category = getattr(move_used, 'category', None)
                     
                     if move_category in [MoveCategory.PHYSICAL, MoveCategory.SPECIAL]:
-                        # REMOVED: Attack bias (+0.3) - let damage_delta handle attack incentives
-                        # This prevents rewarding ineffective attacks (e.g. Earthquake vs Flying)
+                        # NEW: Direct damage feedback - reward actual HP damage dealt to opponent
+                        # GENTLE: 0.1x multiplier (max +0.1 for 100% damage) - win signal dominates
+                        if battle.opponent_active_pokemon and prior_battle.opponent_active_pokemon:
+                            # Calculate direct damage dealt this turn
+                            prior_opp_hp = getattr(prior_battle.opponent_active_pokemon, 'current_hp_fraction', 1.0)
+                            current_opp_hp = getattr(battle.opponent_active_pokemon, 'current_hp_fraction', 1.0)
+                            damage_dealt = max(0.0, prior_opp_hp - current_opp_hp)
+                            
+                            # Small immediate feedback for successful hits (avoid overwhelming KO/damage_delta rewards)
+                            if damage_dealt > 0:
+                                reward += min(damage_dealt * 0.1, 0.1)
+                        
+                        # NEW: Reward using boosted stats for attacks (capitalizing on setup)
+                        if prior_battle.active_pokemon:
+                            active_boosts = getattr(prior_battle.active_pokemon, 'boosts', {})
+                            relevant_stat = 'atk' if move_category == MoveCategory.PHYSICAL else 'spa'
+                            boost_level = active_boosts.get(relevant_stat, 0)
+                            
+                            if boost_level > 0:
+                                reward += min(boost_level * 0.05, 0.3)  # GENTLE: max +0.3 at +6 boosts
                         
                         if battle.opponent_active_pokemon and prior_battle.opponent_active_pokemon:
                             # Moderate penalty for triggering immunity abilities
                             if self.is_nullified(move_used, prior_battle.opponent_active_pokemon):
-                                reward -= 0.8
+                                reward -= 0.2  # GENTLE: clear signal without dominating
                             
                             try:
                                 opp_types = self._extract_pokemon_types(battle.opponent_active_pokemon)
@@ -429,11 +449,11 @@ class ShowdownEnvironment(BaseShowdownEnv):
                                     effectiveness = self.move_effectiveness(move_used.type.name.title(), tuple(opp_types))
                                     
                                     if effectiveness >= 2.0: #rewards good choices
-                                        reward += 0.3
+                                        reward += 0.2
                                     
                                     # Penalise type immunity
                                     elif effectiveness == 0.0:
-                                        reward -= 1.0  # Immune move (always wrong: Earthquake vs Flying)
+                                        reward -= 0.2 
                             except:
                                 pass
                     
@@ -448,7 +468,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                         status_reward = self._evaluate_status_move_effectiveness(move_used, battle, prior_battle)
                         reward += status_reward  # Smart status use vs redundant spam
         
-        return np.clip(reward, -1.0, 0.8)  # UPDATED: +0.3 super-effective, -0.8 immunity, -1.0 type immune 
+        return np.clip(reward, -0.3, 0.5)  # GENTLE: Small feedback without dominating episode reward 
     
     def _calc_type_matchup(self, atk_types: list[str], def_types: list[str]) -> float:
         """Helper to calculate offensive/defensive matchup ratio between two type sets."""
@@ -537,13 +557,13 @@ class ShowdownEnvironment(BaseShowdownEnv):
             
 
             if new_matchup >= 2.5:
-                reward += 0.8  # Excellent matchup found
+                reward += 0.2 
             elif new_matchup >= 1.8:
-                reward += 0.5  # Good matchup found
+                reward += 0.15 
             elif new_matchup >= 1.2:
-                reward += 0.3  # Decent matchup
+                reward += 0.1 
             elif new_matchup >= 1.0:
-                reward += 0.1  # Neutral matchup (small exploration bonus)
+                reward += 0.05  
             elif new_matchup >= 0.7:
                 reward += 0.0  # Slight disadvantage (neutral - no reward/penalty)
 
@@ -557,13 +577,13 @@ class ShowdownEnvironment(BaseShowdownEnv):
             
             if team_hp_avg < 0.4:
                 # Team HP low - ENCOURAGE aggressive switching to find answers
-                reward += 0.25  
+                reward += 0.1  
             elif prior_hp_fraction < 0.3:
                 # Emergency escape from low HP
-                reward += 0.25  # Always good to save Pokemon
+                reward += 0.1 
 
         
-        return np.clip(reward, -0.6, 1.3)  # Switching: -0.6 to +1.3 (perfect switch + improvement) 
+        return np.clip(reward, -0.15, 0.2)  # GENTLE: Minimal switching feedback 
     
     def _calculate_spam_penalties(self, battle: AbstractBattle, prior_battle: AbstractBattle | None) -> float:
         """
@@ -584,13 +604,13 @@ class ShowdownEnvironment(BaseShowdownEnv):
             recent_window = self.action_history[-5:]
             switch_count = sum(1 for a in recent_window if a.get('action_type') == 'switch')
             
-            # PROGRESSIVE spam penalties - scales with frequency to prevent over-switching
+ #spam penalities
             if switch_count >= 5:
-                reward -= 1.5  # Severe penalty for switching every turn
+                reward -= 0.2
             elif switch_count >= 4:
-                reward -= 0.8  # Strong penalty for very frequent switching
+                reward -= 0.15
             elif switch_count >= 3:
-                reward -= 0.3  # Moderate penalty for frequent switching
+                reward -= 0.1
             # 1-2 switches in 5 turns is fine (strategic play) 
 
         current_action_category = current_action.get('action_category', '')
@@ -599,9 +619,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
             boost_count = sum(1 for a in recent_window if a.get('action_category') == 'boost')
             
             if boost_count >= 3:
-                reward -= 1.5  # Discourage excessive stat boosting
+                reward -= 0.3
             elif boost_count >= 2:
-                reward -= 0.5  # Mild penalty for frequent boosting 
+                reward -= 0.15
         
         #consecutive entry hazard
         if len(self.action_history) >= 1:
@@ -617,9 +637,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
             # Penalty for duplicate/excessive hazards
             if consecutive_hazards >= 2:
-                reward -= 1.0
+                reward -= 0.2 
     
-        return np.clip(reward, -4.0, 0.0)  # Only penalties 
+        return np.clip(reward, -0.5, 0.0)  # GENTLE: Only small penalties 
     
     def _calculate_strategic_outcomes(self, battle: AbstractBattle, prior_battle: AbstractBattle | None) -> float:
         """
@@ -653,11 +673,11 @@ class ShowdownEnvironment(BaseShowdownEnv):
                             break
                 
                 if not hazards_exist:
-                    reward += 1.2  # INCREASED from 1.0 for positive reinforcement
+                    reward += 0.2  # GENTLE: Small positive for good play
                 else:
-                    reward -= 1.0  # Clear spam penalty
+                    reward -= 0.15  # GENTLE: Small negative for spam
         
-        return np.clip(reward, -1.0, 1.0)
+        return np.clip(reward, -0.2, 0.2)  # GENTLE: Minimal strategic feedback
     
     def _can_ko_opponent(self, move: Move, battle: AbstractBattle) -> bool:
         """Estimate if move can KO opponent (simplified check)"""
